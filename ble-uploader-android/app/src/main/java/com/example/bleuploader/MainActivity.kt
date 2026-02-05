@@ -42,6 +42,7 @@ class MainActivity : AppCompatActivity() {
     private var bluetoothAdapter: BluetoothAdapter? = null
     private var bluetoothLeScanner: BluetoothLeScanner? = null
     private var gatt: BluetoothGatt? = null
+    private var isScanning = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -54,12 +55,11 @@ class MainActivity : AppCompatActivity() {
         bluetoothAdapter = bluetoothManager.adapter
         bluetoothLeScanner = bluetoothAdapter?.bluetoothLeScanner
 
-        scanButton.setOnClickListener {
-            ensurePermissionsAndStart()
-        }
+        scanButton.setOnClickListener { ensurePermissionsAndStart() }
     }
 
     override fun onDestroy() {
+        stopScanIfNeeded()
         gatt?.close()
         executor.shutdown()
         super.onDestroy()
@@ -70,6 +70,12 @@ class MainActivity : AppCompatActivity() {
             requestRequiredPermissions()
             return
         }
+
+        if (bluetoothAdapter?.isEnabled != true) {
+            updateStatus("Bluetooth está desligado")
+            return
+        }
+
         startScan()
     }
 
@@ -88,10 +94,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun requestRequiredPermissions() {
         val permissions = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            arrayOf(
-                Manifest.permission.BLUETOOTH_SCAN,
-                Manifest.permission.BLUETOOTH_CONNECT
-            )
+            arrayOf(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT)
         } else {
             arrayOf(Manifest.permission.ACCESS_FINE_LOCATION)
         }
@@ -113,14 +116,28 @@ class MainActivity : AppCompatActivity() {
 
     @SuppressLint("MissingPermission")
     private fun startScan() {
+        if (isScanning) return
+        val scanner = bluetoothLeScanner ?: run {
+            updateStatus("BLE não disponível neste aparelho")
+            return
+        }
+
         updateStatus("Procurando dispositivos BLE...")
-        bluetoothLeScanner?.startScan(scanCallback)
+        isScanning = true
+        scanner.startScan(scanCallback)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun stopScanIfNeeded() {
+        if (!isScanning) return
+        bluetoothLeScanner?.stopScan(scanCallback)
+        isScanning = false
     }
 
     @SuppressLint("MissingPermission")
     private fun connectToDevice(result: ScanResult) {
+        stopScanIfNeeded()
         updateStatus("Conectando a ${result.device.address}")
-        bluetoothLeScanner?.stopScan(scanCallback)
         gatt?.close()
         gatt = result.device.connectGatt(this, false, gattCallback)
     }
@@ -134,12 +151,21 @@ class MainActivity : AppCompatActivity() {
     private val gattCallback = object : BluetoothGattCallback() {
         @SuppressLint("MissingPermission")
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
-            if (newState == BluetoothProfile.STATE_CONNECTED) {
-                updateStatus("Conectado. Descobrindo serviços...")
-                gatt.discoverServices()
-            } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                updateStatus("Desconectado. Reiniciando varredura...")
-                startScan()
+            when {
+                status != BluetoothGatt.GATT_SUCCESS -> {
+                    updateStatus("Falha na conexão BLE (status $status)")
+                    gatt.close()
+                    startScan()
+                }
+                newState == BluetoothProfile.STATE_CONNECTED -> {
+                    updateStatus("Conectado. Descobrindo serviços...")
+                    gatt.discoverServices()
+                }
+                newState == BluetoothProfile.STATE_DISCONNECTED -> {
+                    updateStatus("Desconectado. Reiniciando varredura...")
+                    gatt.close()
+                    startScan()
+                }
             }
         }
 
@@ -149,52 +175,72 @@ class MainActivity : AppCompatActivity() {
                 updateStatus("Falha ao descobrir serviços")
                 return
             }
-            gatt.services.forEach { service ->
-                service.characteristics.forEach { characteristic ->
+
+            var configured = false
+            for (service in gatt.services) {
+                for (characteristic in service.characteristics) {
                     val properties = characteristic.properties
-                    if (properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY != 0 ||
-                        properties and BluetoothGattCharacteristic.PROPERTY_INDICATE != 0
-                    ) {
-                        enableNotifications(gatt, characteristic)
+                    val canNotify = properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY != 0
+                    val canIndicate = properties and BluetoothGattCharacteristic.PROPERTY_INDICATE != 0
+                    val canRead = properties and BluetoothGattCharacteristic.PROPERTY_READ != 0
+
+                    if (canNotify || canIndicate) {
+                        enableNotifications(gatt, characteristic, canIndicate)
+                        configured = true
+                        break
                     }
-                    if (properties and BluetoothGattCharacteristic.PROPERTY_READ != 0) {
+
+                    if (canRead) {
                         gatt.readCharacteristic(characteristic)
+                        configured = true
+                        break
                     }
                 }
+                if (configured) break
             }
-            updateStatus("Aguardando dados BLE...")
+
+            updateStatus(if (configured) "Aguardando dados BLE..." else "Nenhuma característica útil encontrada")
         }
 
         override fun onCharacteristicRead(
             gatt: BluetoothGatt,
             characteristic: BluetoothGattCharacteristic,
+            value: ByteArray,
             status: Int
         ) {
             if (status == BluetoothGatt.GATT_SUCCESS) {
-                handleBleData(characteristic.value)
+                handleBleData(value)
             }
         }
 
         override fun onCharacteristicChanged(
             gatt: BluetoothGatt,
-            characteristic: BluetoothGattCharacteristic
+            characteristic: BluetoothGattCharacteristic,
+            value: ByteArray
         ) {
-            handleBleData(characteristic.value)
+            handleBleData(value)
         }
     }
 
     @SuppressLint("MissingPermission")
-    private fun enableNotifications(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
+    private fun enableNotifications(
+        gatt: BluetoothGatt,
+        characteristic: BluetoothGattCharacteristic,
+        useIndication: Boolean
+    ) {
         gatt.setCharacteristicNotification(characteristic, true)
         val descriptor = characteristic.getDescriptor(CLIENT_CHARACTERISTIC_CONFIG) ?: return
-        descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+        descriptor.value = if (useIndication) {
+            BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
+        } else {
+            BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+        }
         gatt.writeDescriptor(descriptor)
     }
 
     private fun handleBleData(data: ByteArray?) {
-        if (data == null || data.isEmpty()) {
-            return
-        }
+        if (data.isNullOrEmpty()) return
+
         val payload = data.joinToString(separator = " ") { byte -> "%02X".format(byte) }
         updateStatus("Enviando: $payload")
         sendToServer(payload)
@@ -204,11 +250,14 @@ class MainActivity : AppCompatActivity() {
         val urlString = getString(R.string.upload_url)
         executor.execute {
             try {
-                val url = URL(urlString)
-                val connection = url.openConnection() as HttpURLConnection
-                connection.requestMethod = "POST"
-                connection.setRequestProperty("Content-Type", "text/plain; charset=utf-8")
-                connection.doOutput = true
+                val connection = (URL(urlString).openConnection() as HttpURLConnection).apply {
+                    requestMethod = "POST"
+                    connectTimeout = 10_000
+                    readTimeout = 10_000
+                    setRequestProperty("Content-Type", "text/plain; charset=utf-8")
+                    doOutput = true
+                }
+
                 OutputStreamWriter(connection.outputStream, Charsets.UTF_8).use { writer ->
                     writer.write(payload)
                 }
