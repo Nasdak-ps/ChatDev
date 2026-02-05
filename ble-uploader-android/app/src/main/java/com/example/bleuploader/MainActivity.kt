@@ -239,7 +239,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun handleBleData(data: ByteArray?) {
-        if (data.isNullOrEmpty()) return
+        // ByteArray é primitivo; não possui isNullOrEmpty como Array<T>.
+        if (data == null || data.isEmpty()) return
 
         val payload = data.joinToString(separator = " ") { byte -> "%02X".format(byte) }
         updateStatus("Enviando: $payload")

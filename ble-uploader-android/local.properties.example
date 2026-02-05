@@ -1,0 +1,2 @@
+# Copie este arquivo para local.properties e ajuste o caminho do Android SDK.
+sdk.dir=/workspace/android-sdk
